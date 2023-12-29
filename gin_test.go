@@ -1,20 +1,209 @@
-// Copyright 2014 Manu Martinez-Almeida.  All rights reserved.
+// Copyright 2014 Manu Martinez-Almeida. All rights reserved.
 // Use of this source code is governed by a MIT style
 // license that can be found in the LICENSE file.
 
 package gin
 
 import (
+	"crypto/tls"
+	"fmt"
+	"html/template"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"golang.org/x/net/http2"
 )
 
-//TODO
-// func (engine *Engine) LoadHTMLGlob(pattern string) {
-// func (engine *Engine) LoadHTMLFiles(files ...string) {
-// func (engine *Engine) RunTLS(addr string, cert string, key string) error {
+func formatAsDate(t time.Time) string {
+	year, month, day := t.Date()
+	return fmt.Sprintf("%d/%02d/%02d", year, month, day)
+}
+
+func setupHTMLFiles(t *testing.T, mode string, tls bool, loadMethod func(*Engine)) *httptest.Server {
+	SetMode(mode)
+	defer SetMode(TestMode)
+
+	var router *Engine
+	captureOutput(t, func() {
+		router = New()
+		router.Delims("{[{", "}]}")
+		router.SetFuncMap(template.FuncMap{
+			"formatAsDate": formatAsDate,
+		})
+		loadMethod(router)
+		router.GET("/test", func(c *Context) {
+			c.HTML(http.StatusOK, "hello.tmpl", map[string]string{"name": "world"})
+		})
+		router.GET("/raw", func(c *Context) {
+			c.HTML(http.StatusOK, "raw.tmpl", map[string]any{
+				"now": time.Date(2017, 07, 01, 0, 0, 0, 0, time.UTC),
+			})
+		})
+	})
+
+	var ts *httptest.Server
+
+	if tls {
+		ts = httptest.NewTLSServer(router)
+	} else {
+		ts = httptest.NewServer(router)
+	}
+
+	return ts
+}
+
+func TestLoadHTMLGlobDebugMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		DebugMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLGlob("./testdata/template/*")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestH2c(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Error(err)
+	}
+	r := Default()
+	r.UseH2C = true
+	r.GET("/", func(c *Context) {
+		c.String(200, "<h1>Hello world</h1>")
+	})
+	go func() {
+		err := http.Serve(ln, r.Handler())
+		if err != nil {
+			t.Log(err)
+		}
+	}()
+	defer ln.Close()
+
+	url := "http://" + ln.Addr().String() + "/"
+
+	httpClient := http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLS: func(netw, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial(netw, addr)
+			},
+		},
+	}
+
+	res, err := httpClient.Get(url)
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLGlobTestMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		TestMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLGlob("./testdata/template/*")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLGlobReleaseMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		ReleaseMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLGlob("./testdata/template/*")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLGlobUsingTLS(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		DebugMode,
+		true,
+		func(router *Engine) {
+			router.LoadHTMLGlob("./testdata/template/*")
+		},
+	)
+	defer ts.Close()
+
+	// Use InsecureSkipVerify for avoiding `x509: certificate signed by unknown authority` error
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	client := &http.Client{Transport: tr}
+	res, err := client.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLGlobFromFuncMap(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		DebugMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLGlob("./testdata/template/*")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/raw", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "Date: 2017/07/01", string(resp))
+}
 
 func init() {
 	SetMode(TestMode)
@@ -27,23 +216,111 @@ func TestCreateEngine(t *testing.T) {
 	assert.Empty(t, router.Handlers)
 }
 
-// func TestLoadHTMLDebugMode(t *testing.T) {
-// 	router := New()
-// 	SetMode(DebugMode)
-// 	router.LoadHTMLGlob("*.testtmpl")
-// 	r := router.HTMLRender.(render.HTMLDebug)
-// 	assert.Empty(t, r.Files)
-// 	assert.Equal(t, r.Glob, "*.testtmpl")
-//
-// 	router.LoadHTMLFiles("index.html.testtmpl", "login.html.testtmpl")
-// 	r = router.HTMLRender.(render.HTMLDebug)
-// 	assert.Empty(t, r.Glob)
-// 	assert.Equal(t, r.Files, []string{"index.html", "login.html"})
-// 	SetMode(TestMode)
-// }
+func TestLoadHTMLFilesTestMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		TestMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLFiles("./testdata/template/hello.tmpl", "./testdata/template/raw.tmpl")
+		},
+	)
+	defer ts.Close()
 
-func TestLoadHTMLReleaseMode(t *testing.T) {
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
 
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLFilesDebugMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		DebugMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLFiles("./testdata/template/hello.tmpl", "./testdata/template/raw.tmpl")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLFilesReleaseMode(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		ReleaseMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLFiles("./testdata/template/hello.tmpl", "./testdata/template/raw.tmpl")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLFilesUsingTLS(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		TestMode,
+		true,
+		func(router *Engine) {
+			router.LoadHTMLFiles("./testdata/template/hello.tmpl", "./testdata/template/raw.tmpl")
+		},
+	)
+	defer ts.Close()
+
+	// Use InsecureSkipVerify for avoiding `x509: certificate signed by unknown authority` error
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+	client := &http.Client{Transport: tr}
+	res, err := client.Get(fmt.Sprintf("%s/test", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "<h1>Hello world</h1>", string(resp))
+}
+
+func TestLoadHTMLFilesFuncMap(t *testing.T) {
+	ts := setupHTMLFiles(
+		t,
+		TestMode,
+		false,
+		func(router *Engine) {
+			router.LoadHTMLFiles("./testdata/template/hello.tmpl", "./testdata/template/raw.tmpl")
+		},
+	)
+	defer ts.Close()
+
+	res, err := http.Get(fmt.Sprintf("%s/raw", ts.URL))
+	if err != nil {
+		t.Error(err)
+	}
+
+	resp, _ := io.ReadAll(res.Body)
+	assert.Equal(t, "Date: 2017/07/01", string(resp))
 }
 
 func TestAddRoute(t *testing.T) {
@@ -157,7 +434,6 @@ func TestNoMethodWithoutGlobalHandlers(t *testing.T) {
 }
 
 func TestRebuild404Handlers(t *testing.T) {
-
 }
 
 func TestNoMethodWithGlobalHandlers(t *testing.T) {
@@ -191,7 +467,7 @@ func TestNoMethodWithGlobalHandlers(t *testing.T) {
 	compareFunc(t, router.allNoMethod[2], middleware0)
 }
 
-func compareFunc(t *testing.T, a, b interface{}) {
+func compareFunc(t *testing.T, a, b any) {
 	sf1 := reflect.ValueOf(a)
 	sf2 := reflect.ValueOf(b)
 	if sf1.Pointer() != sf2.Pointer() {
@@ -201,45 +477,222 @@ func compareFunc(t *testing.T, a, b interface{}) {
 
 func TestListOfRoutes(t *testing.T) {
 	router := New()
-	router.GET("/favicon.ico", handler_test1)
-	router.GET("/", handler_test1)
+	router.GET("/favicon.ico", handlerTest1)
+	router.GET("/", handlerTest1)
 	group := router.Group("/users")
 	{
-		group.GET("/", handler_test2)
-		group.GET("/:id", handler_test1)
-		group.POST("/:id", handler_test2)
+		group.GET("/", handlerTest2)
+		group.GET("/:id", handlerTest1)
+		group.POST("/:id", handlerTest2)
 	}
 	router.Static("/static", ".")
 
 	list := router.Routes()
 
 	assert.Len(t, list, 7)
-	assert.Contains(t, list, RouteInfo{
+	assertRoutePresent(t, list, RouteInfo{
 		Method:  "GET",
 		Path:    "/favicon.ico",
-		Handler: "github.com/gin-gonic/gin.handler_test1",
+		Handler: "^(.*/vendor/)?github.com/gin-gonic/gin.handlerTest1$",
 	})
-	assert.Contains(t, list, RouteInfo{
+	assertRoutePresent(t, list, RouteInfo{
 		Method:  "GET",
 		Path:    "/",
-		Handler: "github.com/gin-gonic/gin.handler_test1",
+		Handler: "^(.*/vendor/)?github.com/gin-gonic/gin.handlerTest1$",
 	})
-	assert.Contains(t, list, RouteInfo{
+	assertRoutePresent(t, list, RouteInfo{
 		Method:  "GET",
 		Path:    "/users/",
-		Handler: "github.com/gin-gonic/gin.handler_test2",
+		Handler: "^(.*/vendor/)?github.com/gin-gonic/gin.handlerTest2$",
 	})
-	assert.Contains(t, list, RouteInfo{
+	assertRoutePresent(t, list, RouteInfo{
 		Method:  "GET",
 		Path:    "/users/:id",
-		Handler: "github.com/gin-gonic/gin.handler_test1",
+		Handler: "^(.*/vendor/)?github.com/gin-gonic/gin.handlerTest1$",
 	})
-	assert.Contains(t, list, RouteInfo{
+	assertRoutePresent(t, list, RouteInfo{
 		Method:  "POST",
 		Path:    "/users/:id",
-		Handler: "github.com/gin-gonic/gin.handler_test2",
+		Handler: "^(.*/vendor/)?github.com/gin-gonic/gin.handlerTest2$",
 	})
 }
 
-func handler_test1(c *Context) {}
-func handler_test2(c *Context) {}
+func TestEngineHandleContext(t *testing.T) {
+	r := New()
+	r.GET("/", func(c *Context) {
+		c.Request.URL.Path = "/v2"
+		r.HandleContext(c)
+	})
+	v2 := r.Group("/v2")
+	{
+		v2.GET("/", func(c *Context) {})
+	}
+
+	assert.NotPanics(t, func() {
+		w := PerformRequest(r, "GET", "/")
+		assert.Equal(t, 301, w.Code)
+	})
+}
+
+func TestEngineHandleContextManyReEntries(t *testing.T) {
+	expectValue := 10000
+
+	var handlerCounter, middlewareCounter int64
+
+	r := New()
+	r.Use(func(c *Context) {
+		atomic.AddInt64(&middlewareCounter, 1)
+	})
+	r.GET("/:count", func(c *Context) {
+		countStr := c.Param("count")
+		count, err := strconv.Atoi(countStr)
+		assert.NoError(t, err)
+
+		n, err := c.Writer.Write([]byte("."))
+		assert.NoError(t, err)
+		assert.Equal(t, 1, n)
+
+		switch {
+		case count > 0:
+			c.Request.URL.Path = "/" + strconv.Itoa(count-1)
+			r.HandleContext(c)
+		}
+	}, func(c *Context) {
+		atomic.AddInt64(&handlerCounter, 1)
+	})
+
+	assert.NotPanics(t, func() {
+		w := PerformRequest(r, "GET", "/"+strconv.Itoa(expectValue-1)) // include 0 value
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, expectValue, w.Body.Len())
+	})
+
+	assert.Equal(t, int64(expectValue), handlerCounter)
+	assert.Equal(t, int64(expectValue), middlewareCounter)
+}
+
+func TestPrepareTrustedCIRDsWith(t *testing.T) {
+	r := New()
+
+	// valid ipv4 cidr
+	{
+		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("0.0.0.0/0")}
+		err := r.SetTrustedProxies([]string{"0.0.0.0/0"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, expectedTrustedCIDRs, r.trustedCIDRs)
+	}
+
+	// invalid ipv4 cidr
+	{
+		err := r.SetTrustedProxies([]string{"192.168.1.33/33"})
+
+		assert.Error(t, err)
+	}
+
+	// valid ipv4 address
+	{
+		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("192.168.1.33/32")}
+
+		err := r.SetTrustedProxies([]string{"192.168.1.33"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, expectedTrustedCIDRs, r.trustedCIDRs)
+	}
+
+	// invalid ipv4 address
+	{
+		err := r.SetTrustedProxies([]string{"192.168.1.256"})
+
+		assert.Error(t, err)
+	}
+
+	// valid ipv6 address
+	{
+		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("2002:0000:0000:1234:abcd:ffff:c0a8:0101/128")}
+		err := r.SetTrustedProxies([]string{"2002:0000:0000:1234:abcd:ffff:c0a8:0101"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, expectedTrustedCIDRs, r.trustedCIDRs)
+	}
+
+	// invalid ipv6 address
+	{
+		err := r.SetTrustedProxies([]string{"gggg:0000:0000:1234:abcd:ffff:c0a8:0101"})
+
+		assert.Error(t, err)
+	}
+
+	// valid ipv6 cidr
+	{
+		expectedTrustedCIDRs := []*net.IPNet{parseCIDR("::/0")}
+		err := r.SetTrustedProxies([]string{"::/0"})
+
+		assert.NoError(t, err)
+		assert.Equal(t, expectedTrustedCIDRs, r.trustedCIDRs)
+	}
+
+	// invalid ipv6 cidr
+	{
+		err := r.SetTrustedProxies([]string{"gggg:0000:0000:1234:abcd:ffff:c0a8:0101/129"})
+
+		assert.Error(t, err)
+	}
+
+	// valid combination
+	{
+		expectedTrustedCIDRs := []*net.IPNet{
+			parseCIDR("::/0"),
+			parseCIDR("192.168.0.0/16"),
+			parseCIDR("172.16.0.1/32"),
+		}
+		err := r.SetTrustedProxies([]string{
+			"::/0",
+			"192.168.0.0/16",
+			"172.16.0.1",
+		})
+
+		assert.NoError(t, err)
+		assert.Equal(t, expectedTrustedCIDRs, r.trustedCIDRs)
+	}
+
+	// invalid combination
+	{
+		err := r.SetTrustedProxies([]string{
+			"::/0",
+			"192.168.0.0/16",
+			"172.16.0.256",
+		})
+
+		assert.Error(t, err)
+	}
+
+	// nil value
+	{
+		err := r.SetTrustedProxies(nil)
+
+		assert.Nil(t, r.trustedCIDRs)
+		assert.Nil(t, err)
+	}
+}
+
+func parseCIDR(cidr string) *net.IPNet {
+	_, parsedCIDR, err := net.ParseCIDR(cidr)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return parsedCIDR
+}
+
+func assertRoutePresent(t *testing.T, gotRoutes RoutesInfo, wantRoute RouteInfo) {
+	for _, gotRoute := range gotRoutes {
+		if gotRoute.Path == wantRoute.Path && gotRoute.Method == wantRoute.Method {
+			assert.Regexp(t, wantRoute.Handler, gotRoute.Handler)
+			return
+		}
+	}
+	t.Errorf("route not found: %v", wantRoute)
+}
+
+func handlerTest1(c *Context) {}
+func handlerTest2(c *Context) {}

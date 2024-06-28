@@ -274,6 +274,22 @@ func TestBadUnixSocket(t *testing.T) {
 	assert.Error(t, router.RunUnix("#/tmp/unix_unit_test"))
 }
 
+func TestRunQUIC(t *testing.T) {
+	router := New()
+	go func() {
+		router.GET("/example", func(c *Context) { c.String(http.StatusOK, "it worked") })
+
+		assert.NoError(t, router.RunQUIC(":8443", "./testdata/certificate/cert.pem", "./testdata/certificate/key.pem"))
+	}()
+
+	// have to wait for the goroutine to start and run the server
+	// otherwise the main thread will complete
+	time.Sleep(5 * time.Millisecond)
+
+	assert.Error(t, router.RunQUIC(":8443", "./testdata/certificate/cert.pem", "./testdata/certificate/key.pem"))
+	testRequest(t, "https://localhost:8443/example")
+}
+
 func TestFileDescriptor(t *testing.T) {
 	router := New()
 
@@ -560,4 +576,29 @@ func TestTreeRunDynamicRouting(t *testing.T) {
 
 func isWindows() bool {
 	return runtime.GOOS == "windows"
+}
+
+func TestEscapedColon(t *testing.T) {
+	router := New()
+	f := func(u string) {
+		router.GET(u, func(c *Context) { c.String(http.StatusOK, u) })
+	}
+	f("/r/r\\:r")
+	f("/r/r:r")
+	f("/r/r/:r")
+	f("/r/r/\\:r")
+	f("/r/r/r\\:r")
+	assert.Panics(t, func() {
+		f("\\foo:")
+	})
+
+	router.updateRouteTrees()
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	testRequest(t, ts.URL+"/r/r123", "", "/r/r:r")
+	testRequest(t, ts.URL+"/r/r:r", "", "/r/r\\:r")
+	testRequest(t, ts.URL+"/r/r/r123", "", "/r/r/:r")
+	testRequest(t, ts.URL+"/r/r/:r", "", "/r/r/\\:r")
+	testRequest(t, ts.URL+"/r/r/r:r", "", "/r/r/r\\:r")
 }

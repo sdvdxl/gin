@@ -34,6 +34,7 @@ const (
 	MIMEPOSTForm          = binding.MIMEPOSTForm
 	MIMEMultipartPOSTForm = binding.MIMEMultipartPOSTForm
 	MIMEYAML              = binding.MIMEYAML
+	MIMEYAML2             = binding.MIMEYAML2
 	MIMETOML              = binding.MIMETOML
 )
 
@@ -42,6 +43,10 @@ const BodyBytesKey = "_gin-gonic/gin/bodybyteskey"
 
 // ContextKey is the key that a Context returns itself for.
 const ContextKey = "_gin-gonic/gin/contextkey"
+
+type ContextKeyType int
+
+const ContextRequestKey ContextKeyType = 0
 
 // abortIndex represents a typical value used in abort functions.
 const abortIndex int8 = math.MaxInt8 >> 1
@@ -113,20 +118,27 @@ func (c *Context) Copy() *Context {
 	cp := Context{
 		writermem: c.writermem,
 		Request:   c.Request,
-		Params:    c.Params,
 		engine:    c.engine,
 	}
+
 	cp.writermem.ResponseWriter = nil
 	cp.Writer = &cp.writermem
 	cp.index = abortIndex
 	cp.handlers = nil
-	cp.Keys = map[string]any{}
-	for k, v := range c.Keys {
+	cp.fullPath = c.fullPath
+
+	cKeys := c.Keys
+	cp.Keys = make(map[string]any, len(cKeys))
+	c.mu.RLock()
+	for k, v := range cKeys {
 		cp.Keys[k] = v
 	}
-	paramCopy := make([]Param, len(cp.Params))
-	copy(paramCopy, cp.Params)
-	cp.Params = paramCopy
+	c.mu.RUnlock()
+
+	cParams := c.Params
+	cp.Params = make([]Param, len(cParams))
+	copy(cp.Params, cParams)
+
 	return &cp
 }
 
@@ -141,6 +153,9 @@ func (c *Context) HandlerName() string {
 func (c *Context) HandlerNames() []string {
 	hn := make([]string, 0, len(c.handlers))
 	for _, val := range c.handlers {
+		if val == nil {
+			continue
+		}
 		hn = append(hn, nameOfFunction(val))
 	}
 	return hn
@@ -171,6 +186,9 @@ func (c *Context) FullPath() string {
 func (c *Context) Next() {
 	c.index++
 	for c.index < int8(len(c.handlers)) {
+		if c.handlers[c.index] == nil {
+			continue
+		}
 		c.handlers[c.index](c)
 		c.index++
 	}
@@ -386,7 +404,7 @@ func (c *Context) GetStringMapStringSlice(key string) (smss map[string][]string)
 //
 //	router.GET("/user/:id", func(c *gin.Context) {
 //	    // a GET request to /user/john
-//	    id := c.Param("id") // id == "/john"
+//	    id := c.Param("id") // id == "john"
 //	    // a GET request to /user/john/
 //	    id := c.Param("id") // id == "/john/"
 //	})
@@ -457,7 +475,7 @@ func (c *Context) QueryArray(key string) (values []string) {
 
 func (c *Context) initQueryCache() {
 	if c.queryCache == nil {
-		if c.Request != nil {
+		if c.Request != nil && c.Request.URL != nil {
 			c.queryCache = c.Request.URL.Query()
 		} else {
 			c.queryCache = url.Values{}
@@ -603,7 +621,7 @@ func (c *Context) SaveUploadedFile(file *multipart.FileHeader, dst string) error
 	}
 	defer src.Close()
 
-	if err = os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
+	if err = os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
 		return err
 	}
 
@@ -654,6 +672,11 @@ func (c *Context) BindYAML(obj any) error {
 // BindTOML is a shortcut for c.MustBindWith(obj, binding.TOML).
 func (c *Context) BindTOML(obj any) error {
 	return c.MustBindWith(obj, binding.TOML)
+}
+
+// BindPlain is a shortcut for c.MustBindWith(obj, binding.Plain).
+func (c *Context) BindPlain(obj any) error {
+	return c.MustBindWith(obj, binding.Plain)
 }
 
 // BindHeader is a shortcut for c.MustBindWith(obj, binding.Header).
@@ -721,6 +744,11 @@ func (c *Context) ShouldBindTOML(obj any) error {
 	return c.ShouldBindWith(obj, binding.TOML)
 }
 
+// ShouldBindPlain is a shortcut for c.ShouldBindWith(obj, binding.Plain).
+func (c *Context) ShouldBindPlain(obj any) error {
+	return c.ShouldBindWith(obj, binding.Plain)
+}
+
 // ShouldBindHeader is a shortcut for c.ShouldBindWith(obj, binding.Header).
 func (c *Context) ShouldBindHeader(obj any) error {
 	return c.ShouldBindWith(obj, binding.Header)
@@ -728,7 +756,7 @@ func (c *Context) ShouldBindHeader(obj any) error {
 
 // ShouldBindUri binds the passed struct pointer using the specified binding engine.
 func (c *Context) ShouldBindUri(obj any) error {
-	m := make(map[string][]string)
+	m := make(map[string][]string, len(c.Params))
 	for _, v := range c.Params {
 		m[v.Key] = []string{v.Value}
 	}
@@ -761,6 +789,31 @@ func (c *Context) ShouldBindBodyWith(obj any, bb binding.BindingBody) (err error
 		c.Set(BodyBytesKey, body)
 	}
 	return bb.BindBody(body, obj)
+}
+
+// ShouldBindBodyWithJSON is a shortcut for c.ShouldBindBodyWith(obj, binding.JSON).
+func (c *Context) ShouldBindBodyWithJSON(obj any) error {
+	return c.ShouldBindBodyWith(obj, binding.JSON)
+}
+
+// ShouldBindBodyWithXML is a shortcut for c.ShouldBindBodyWith(obj, binding.XML).
+func (c *Context) ShouldBindBodyWithXML(obj any) error {
+	return c.ShouldBindBodyWith(obj, binding.XML)
+}
+
+// ShouldBindBodyWithYAML is a shortcut for c.ShouldBindBodyWith(obj, binding.YAML).
+func (c *Context) ShouldBindBodyWithYAML(obj any) error {
+	return c.ShouldBindBodyWith(obj, binding.YAML)
+}
+
+// ShouldBindBodyWithTOML is a shortcut for c.ShouldBindBodyWith(obj, binding.TOML).
+func (c *Context) ShouldBindBodyWithTOML(obj any) error {
+	return c.ShouldBindBodyWith(obj, binding.TOML)
+}
+
+// ShouldBindBodyWithJSON is a shortcut for c.ShouldBindBodyWith(obj, binding.JSON).
+func (c *Context) ShouldBindBodyWithPlain(obj any) error {
+	return c.ShouldBindBodyWith(obj, binding.Plain)
 }
 
 // ClientIP implements one best effort algorithm to return the real client IP.
@@ -873,6 +926,9 @@ func (c *Context) GetHeader(key string) string {
 
 // GetRawData returns stream data.
 func (c *Context) GetRawData() ([]byte, error) {
+	if c.Request.Body == nil {
+		return nil, errors.New("cannot read nil body")
+	}
 	return io.ReadAll(c.Request.Body)
 }
 
@@ -1127,7 +1183,7 @@ func (c *Context) Negotiate(code int, config Negotiate) {
 		data := chooseData(config.XMLData, config.Data)
 		c.XML(code, data)
 
-	case binding.MIMEYAML:
+	case binding.MIMEYAML, binding.MIMEYAML2:
 		data := chooseData(config.YAMLData, config.Data)
 		c.YAML(code, data)
 
@@ -1215,7 +1271,7 @@ func (c *Context) Err() error {
 // if no value is associated with key. Successive calls to Value with
 // the same key returns the same result.
 func (c *Context) Value(key any) any {
-	if key == 0 {
+	if key == ContextRequestKey {
 		return c.Request
 	}
 	if key == ContextKey {

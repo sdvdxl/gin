@@ -7,6 +7,7 @@ package binding
 import (
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"reflect"
 	"strconv"
 	"strings"
@@ -164,6 +165,23 @@ func tryToSetValue(value reflect.Value, field reflect.StructField, setter setter
 	return setter.TrySet(value, field, tagValue, setOpt)
 }
 
+// BindUnmarshaler is the interface used to wrap the UnmarshalParam method.
+type BindUnmarshaler interface {
+	// UnmarshalParam decodes and assigns a value from an form or query param.
+	UnmarshalParam(param string) error
+}
+
+// trySetCustom tries to set a custom type value
+// If the value implements the BindUnmarshaler interface, it will be used to set the value, we will return `true`
+// to skip the default value setting.
+func trySetCustom(val string, value reflect.Value) (isSet bool, err error) {
+	switch v := value.Addr().Interface().(type) {
+	case BindUnmarshaler:
+		return true, v.UnmarshalParam(val)
+	}
+	return false, nil
+}
+
 func setByForm(value reflect.Value, field reflect.StructField, form map[string][]string, tagValue string, opt setOptions) (isSet bool, err error) {
 	vs, ok := form[tagValue]
 	if !ok && !opt.isDefaultExists {
@@ -175,14 +193,25 @@ func setByForm(value reflect.Value, field reflect.StructField, form map[string][
 		if !ok {
 			vs = []string{opt.defaultValue}
 		}
+
+		if ok, err = trySetCustom(vs[0], value); ok {
+			return ok, err
+		}
+
 		return true, setSlice(vs, value, field)
 	case reflect.Array:
 		if !ok {
 			vs = []string{opt.defaultValue}
 		}
+
+		if ok, err = trySetCustom(vs[0], value); ok {
+			return ok, err
+		}
+
 		if len(vs) != value.Len() {
 			return false, fmt.Errorf("%q is not valid value for %s", vs, value.Type().String())
 		}
+
 		return true, setArray(vs, value, field)
 	default:
 		var val string
@@ -192,6 +221,9 @@ func setByForm(value reflect.Value, field reflect.StructField, form map[string][
 
 		if len(vs) > 0 {
 			val = vs[0]
+		}
+		if ok, err := trySetCustom(val, value); ok {
+			return ok, err
 		}
 		return true, setWithProperType(val, value, field)
 	}
@@ -235,6 +267,8 @@ func setWithProperType(val string, value reflect.Value, field reflect.StructFiel
 		switch value.Interface().(type) {
 		case time.Time:
 			return setTimeField(val, field, value)
+		case multipart.FileHeader:
+			return nil
 		}
 		return json.Unmarshal(bytesconv.StringToBytes(val), value.Addr().Interface())
 	case reflect.Map:
@@ -374,11 +408,8 @@ func setTimeDuration(val string, value reflect.Value) error {
 }
 
 func head(str, sep string) (head string, tail string) {
-	idx := strings.Index(str, sep)
-	if idx < 0 {
-		return str, ""
-	}
-	return str[:idx], str[idx+len(sep):]
+	head, tail, _ = strings.Cut(str, sep)
+	return head, tail
 }
 
 func setFormMap(ptr any, form map[string][]string) error {

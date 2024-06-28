@@ -3,7 +3,6 @@ run:
 linters:
   enable:
     - asciicheck
-    - depguard
     - dogsled
     - durationcheck
     - errcheck
@@ -56,3 +55,6 @@ issues:
     - linters:
         - revive
       path: _test\.go
+    - path: gin.go
+      linters:
+        - gci
